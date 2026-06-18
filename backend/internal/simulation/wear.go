@@ -77,12 +77,18 @@ func (wc *WearCalculator) Calculate(input *WearCalcInput) *WearCalcOutput {
 	)
 
 	var wearCoefficient float64
+	baseK := config.AppConfig.WearCalc.ArchardK
 	if ehlFilmParam >= 3.0 {
-		wearCoefficient = config.AppConfig.WearCalc.ArchardK * 0.1
+		wearCoefficient = baseK * 0.1
 	} else if ehlFilmParam >= 1.0 {
-		wearCoefficient = config.AppConfig.WearCalc.ArchardK * (0.1 + 0.9*(3.0-ehlFilmParam)/2.0)
+		acRatio := math.Pow(1.0-ehlFilmParam/3.0, 2)
+		wearCoefficient = baseK * (0.1 + 1.9*acRatio)
 	} else {
-		wearCoefficient = config.AppConfig.WearCalc.ArchardK * 2.0
+		acRatio := 1.0 - 0.33*ehlFilmParam
+		if acRatio > 0.95 {
+			acRatio = 0.95
+		}
+		wearCoefficient = baseK * (2.0 + 3.0*acRatio)
 	}
 
 	tempFactor := 1.0
@@ -119,20 +125,39 @@ func calculateEHLFilmParameter(
 		return 0.1
 	}
 
-	entrainmentVelocity := effectiveRadius * speedRPM * 2.0 * math.Pi / 60.0
-
-	alphaPressureViscosity := 2.2e-8
-
+	alphaPV := 2.2e-8
 	reducedModulus := 2.0e11
-	poissonRatio := 0.3
+	roughnessRMS := 0.4e-6
 
-	contactArea := math.Pi * effectiveRadius * effectiveRadius * 0.5
-	maxHertzPressure := math.Sqrt(load * reducedModulus / (math.Pi * effectiveRadius * (1 - poissonRatio*poissonRatio)))
+	u := effectiveRadius * speedRPM * 2.0 * math.Pi / 60.0
+	if u < 1e-6 {
+		u = 1e-6
+	}
 
-	lambda := filmThickness * 1e-6 / math.Sqrt(
-		3.0*math.Pow(alphaPressureViscosity*viscosity*entrainmentVelocity, 2.0/3.0) *
-			math.Pow(effectiveRadius/reducedModulus, 1.0/3.0),
-	)
+	R := effectiveRadius
+	G := alphaPV * reducedModulus
+	U := (viscosity * u) / (reducedModulus * R)
+	W := load / (reducedModulus * R)
+
+	hMin := 3.63 * R * math.Pow(U, 0.68) * math.Pow(G, 0.49) * math.Pow(W, -0.073)
+
+	if U > 1e-12 {
+		hMinAlt := 2.65 * R * math.Pow(G, 0.54) * math.Pow(U, 0.7) * math.Pow(W, -0.13)
+		if hMinAlt < hMin {
+			hMin = hMinAlt
+		}
+	}
+
+	if temperature > 40.0 {
+		tempViscRatio := math.Pow(40.0/temperature, 1.5)
+		hMin *= tempViscRatio
+	}
+
+	lambda := hMin / roughnessRMS
+
+	if lambda < 3.0 {
+		lambda = applyMixedLubricationCorrection(lambda, load, u, viscosity, effectiveRadius)
+	}
 
 	if math.IsNaN(lambda) || lambda < 0 {
 		lambda = 0.1
@@ -142,6 +167,41 @@ func calculateEHLFilmParameter(
 	}
 
 	return lambda
+}
+
+func applyMixedLubricationCorrection(lambda, load, velocity, viscosity, radius float64) float64 {
+	sommerfeldNumber := viscosity * velocity * radius * radius / load
+
+	var asperityContactRatio float64
+	if lambda >= 3.0 {
+		asperityContactRatio = 0.0
+	} else if lambda >= 1.0 {
+		asperityContactRatio = 1.0 - lambda/3.0
+		asperityContactRatio *= asperityContactRatio
+	} else {
+		asperityContactRatio = 1.0 - 0.33*lambda
+		if asperityContactRatio > 0.95 {
+			asperityContactRatio = 0.95
+		}
+	}
+
+	if sommerfeldNumber < 1e-4 {
+		lambda *= 0.6
+	} else if sommerfeldNumber < 1e-2 {
+		lambda *= (0.6 + 0.4*math.Log10(sommerfeldNumber/1e-4)/2.0)
+	}
+
+	loadSeverity := math.Sqrt(load / 10000.0)
+	if loadSeverity > 1.0 {
+		lambda /= (1.0 + 0.15*(loadSeverity-1.0))
+	}
+
+	effectiveLambda := lambda * (1.0 - 0.3*asperityContactRatio)
+	if effectiveLambda < 0.05 {
+		effectiveLambda = 0.05
+	}
+
+	return effectiveLambda
 }
 
 func averageFloat(values []float64) float64 {
@@ -218,6 +278,23 @@ func GenerateOilFilmMap(
 			}
 
 			film := baseThickness * (1.0 - pressureReduction - tempReduction)
+
+			effectiveRadiusM := (innerR + (outerR-innerR)*radiusRatio) / 1000.0
+			u := effectiveRadiusM * avgSpeed * 2.0 * math.Pi / 60.0
+			sommerfeld := bearing.OilViscosityPaS * u * effectiveRadiusM * effectiveRadiusM / avgLoad
+
+			if sommerfeld < 1e-4 {
+				mixedCorrection := 0.5 + 0.5*math.Log10(sommerfeld/1e-6)/2.0
+				if mixedCorrection < 0.3 {
+					mixedCorrection = 0.3
+				}
+				film *= mixedCorrection
+			}
+
+			loadSeverity := math.Sqrt(avgLoad / 10000.0)
+			if loadSeverity > 1.0 {
+				film /= (1.0 + 0.1*(loadSeverity-1.0))
+			}
 
 			noise := (math.Sin(float64(i*7+j*11)) * 0.05)
 			film = film * (1.0 + noise)
