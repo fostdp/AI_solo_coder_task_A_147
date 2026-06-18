@@ -7,12 +7,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"noria-bearing-system/internal/api"
 	"noria-bearing-system/internal/config"
 	"noria-bearing-system/internal/database"
 	"noria-bearing-system/internal/models"
+	"noria-bearing-system/internal/monitoring"
 	"noria-bearing-system/internal/modules/alarm_mqtt"
 	"noria-bearing-system/internal/modules/life_predictor"
 	"noria-bearing-system/internal/modules/messages"
@@ -20,6 +22,8 @@ import (
 	"noria-bearing-system/internal/modules/wear_simulator"
 	"noria-bearing-system/internal/scheduler"
 )
+
+var Version = "dev"
 
 func main() {
 	configPath := "config.yaml"
@@ -30,6 +34,7 @@ func main() {
 	if err := config.Load(configPath); err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+	log.Printf("水转筒车轴承磨损仿真系统 v%s", Version)
 	log.Println("配置文件加载成功 (含JSON参数文件)")
 	log.Printf("  - 磨损参数: Archard K=%.2e, EHL参考温度=%.1f°C",
 		config.AppConfig.WearParams.ArchardKBase,
@@ -45,8 +50,24 @@ func main() {
 	defer database.Instance.Close()
 	log.Println("数据库连接成功")
 
+	_ = monitoring.Get()
+	pprofSrv := monitoring.StartPProfServer(":6060")
+	metricsSrv := monitoring.StartPrometheusServer(":9090")
+	log.Println("监控服务已启动 (pprof:6060, metrics:9090)")
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if pprofSrv != nil {
+			pprofSrv.Shutdown(shutdownCtx)
+		}
+		if metricsSrv != nil {
+			metricsSrv.Shutdown(shutdownCtx)
+		}
+	}()
 
 	channels := messages.NewModuleChannels(100)
 	log.Println("模块通信通道已创建 (缓冲区: 100)")
@@ -121,12 +142,15 @@ func main() {
 	}
 	defer modbusReceiver.Stop()
 
+	api.SetVersion(Version)
+
 	r := gin.Default()
 	r.Use(api.CORSMiddleware(config.AppConfig.Server.CORSOrigins))
 
 	handler := api.NewHandler()
 
 	r.GET("/health", handler.HealthCheck)
+	r.GET("/api/health", handler.HealthCheck)
 
 	apiV1 := r.Group("/api/v1")
 	{

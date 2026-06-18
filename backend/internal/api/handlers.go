@@ -16,6 +16,12 @@ import (
 	"noria-bearing-system/internal/modules/wear_simulator"
 )
 
+var Version = "dev"
+
+func SetVersion(v string) {
+	Version = v
+}
+
 type Handler struct {
 }
 
@@ -406,10 +412,18 @@ func (h *Handler) TriggerCalculation(c *gin.Context) {
 }
 
 func (h *Handler) HealthCheck(c *gin.Context) {
+	dbOk := true
+	if err := database.Instance.Ping(c.Request.Context()); err != nil {
+		dbOk = false
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":    "ok",
-		"timestamp": time.Now(),
+		"timestamp": time.Now().UTC(),
 		"service":   "noria-bearing-system",
+		"version":   Version,
+		"database": map[string]interface{}{
+			"connected": dbOk,
+		},
 	})
 }
 

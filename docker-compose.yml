@@ -1,0 +1,171 @@
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:2.13.0-pg16
+    container_name: noria-timescaledb
+    environment:
+      POSTGRES_USER: noria
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-noria_secret}
+      POSTGRES_DB: noria_bearing
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./sql/timescale_policy.sql:/docker-entrypoint-initdb.d/1_policy.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U noria -d noria_bearing"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - noria-net
+
+  mqtt-broker:
+    image: eclipse-mosquitto:2.0.18
+    container_name: noria-mqtt-broker
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mqtt_data:/mosquitto/data
+      - mqtt_log:/mosquitto/log
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - noria-net
+
+  noria-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: noria-backend
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      mqtt-broker:
+        condition: service_healthy
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "8080:8080"
+      - "5020:5020"
+      - "6060:6060"
+      - "9090:9090"
+    volumes:
+      - ./backend/config.yaml:/app/config.yaml:ro
+      - ./backend/config/:/app/config/:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - noria-net
+
+  nginx-frontend:
+    image: nginx:1.25-alpine
+    container_name: noria-nginx
+    depends_on:
+      - noria-backend
+    ports:
+      - "80:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/nginx/gzip.conf:/etc/nginx/conf.d/gzip.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - noria-net
+
+  sensor-simulator:
+    image: python:3.11-slim
+    container_name: noria-sensor-simulator
+    depends_on:
+      - noria-backend
+    working_dir: /app
+    environment:
+      - TZ=Asia/Shanghai
+      - MODBUS_HOST=noria-backend
+      - MODBUS_PORT=5020
+      - LOAD_PROFILE=${SIM_LOAD_PROFILE:-normal}
+      - SPEED_PROFILE=${SIM_SPEED_PROFILE:-normal}
+      - INTERVAL_SECONDS=${SIM_INTERVAL:-3600}
+      - BEARING_ID=${SIM_BEARING_ID:-1}
+    command: >
+      sh -c "pip install --no-cache-dir pymodbus numpy pyyaml &&
+             python /app/noria_sensor_simulator.py --host $$MODBUS_HOST --port $$MODBUS_PORT
+             --load-profile $$LOAD_PROFILE --speed-profile $$SPEED_PROFILE
+             --interval $$INTERVAL_SECONDS --bearing-id $$BEARING_ID"
+    volumes:
+      - ./simulator:/app:ro
+    profiles:
+      - simulator
+    networks:
+      - noria-net
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: noria-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    networks:
+      - noria-net
+
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: noria-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin123}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deploy/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - ./deploy/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    networks:
+      - noria-net
+
+volumes:
+  timescaledb_data:
+  mqtt_data:
+  mqtt_log:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  noria-net:
+    driver: bridge

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 古代水转筒车轴承传感器模拟器
 通过 Modbus TCP 协议模拟上报轴承温度、径向载荷、转速、润滑油膜厚度数据
+
+支持多工况配置：
+  - load-profile: light / normal / heavy / extreme
+  - speed-profile: low / normal / high / surge
 """
 
 import struct
@@ -12,8 +17,98 @@ import math
 import json
 import argparse
 import threading
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Callable, Dict
+
+
+LOAD_PROFILES: Dict[str, Dict] = {
+    "light": {
+        "name": "轻载工况",
+        "base_load": 2000.0,
+        "load_noise": 150.0,
+        "load_min": 300.0,
+        "load_max": 8000.0,
+        "load_peak_prob": 0.001,
+        "load_peak_range": (1.3, 1.8),
+        "wear_rate": 0.001,
+        "desc": "枯水期低负荷，约2000N",
+    },
+    "normal": {
+        "name": "正常工况",
+        "base_load": 5000.0,
+        "load_noise": 300.0,
+        "load_min": 500.0,
+        "load_max": 20000.0,
+        "load_peak_prob": 0.003,
+        "load_peak_range": (1.5, 2.5),
+        "wear_rate": 0.003,
+        "desc": "常规水量，约5000N",
+    },
+    "heavy": {
+        "name": "重载工况",
+        "base_load": 10000.0,
+        "load_noise": 600.0,
+        "load_min": 2000.0,
+        "load_max": 40000.0,
+        "load_peak_prob": 0.01,
+        "load_peak_range": (1.8, 3.0),
+        "wear_rate": 0.008,
+        "desc": "汛期高负荷，约10000N",
+    },
+    "extreme": {
+        "name": "极端工况",
+        "base_load": 18000.0,
+        "load_noise": 1200.0,
+        "load_min": 5000.0,
+        "load_max": 60000.0,
+        "load_peak_prob": 0.03,
+        "load_peak_range": (2.0, 4.0),
+        "wear_rate": 0.02,
+        "desc": "洪水冲击+满载，约18000N，加速磨损",
+    },
+}
+
+SPEED_PROFILES: Dict[str, Dict] = {
+    "low": {
+        "name": "低速",
+        "base_speed": 6.0,
+        "speed_noise": 0.4,
+        "speed_min": 1.0,
+        "speed_max": 15.0,
+        "speed_surge_prob": 0.0,
+        "desc": "枯水期慢转，约6 RPM",
+    },
+    "normal": {
+        "name": "正常转速",
+        "base_speed": 15.0,
+        "speed_noise": 0.8,
+        "speed_min": 2.0,
+        "speed_max": 50.0,
+        "speed_surge_prob": 0.0,
+        "desc": "常规水流，约15 RPM",
+    },
+    "high": {
+        "name": "高速",
+        "base_speed": 30.0,
+        "speed_noise": 1.5,
+        "speed_min": 5.0,
+        "speed_max": 80.0,
+        "speed_surge_prob": 0.0,
+        "desc": "大流量，约30 RPM",
+    },
+    "surge": {
+        "name": "波动转速",
+        "base_speed": 20.0,
+        "speed_noise": 3.0,
+        "speed_min": 1.0,
+        "speed_max": 90.0,
+        "speed_surge_prob": 0.02,
+        "speed_surge_range": (0.2, 1.8),
+        "desc": "水流不稳定，转速大幅波动",
+    },
+}
 
 
 @dataclass
@@ -22,16 +117,32 @@ class BearingSimulator:
     modbus_addr: int
     bearing_code: str
     position: str
+    load_profile: str = "normal"
+    speed_profile: str = "normal"
 
     base_temp: float = 35.0
-    base_load: float = 5000.0
-    base_speed: float = 15.0
     base_film: float = 3.5
 
     wear_accumulated: float = 0.0
-    wear_rate: float = 0.003
+    start_time: float = field(default_factory=time.time)
 
-    last_time: float = None
+    def __post_init__(self):
+        if self.load_profile not in LOAD_PROFILES:
+            raise ValueError(f"未知载荷工况: {self.load_profile}")
+        if self.speed_profile not in SPEED_PROFILES:
+            raise ValueError(f"未知转速工况: {self.speed_profile}")
+
+    @property
+    def load_cfg(self) -> Dict:
+        return LOAD_PROFILES[self.load_profile]
+
+    @property
+    def speed_cfg(self) -> Dict:
+        return SPEED_PROFILES[self.speed_profile]
+
+    @property
+    def wear_rate(self) -> float:
+        return self.load_cfg["wear_rate"]
 
     def generate_data(self, elapsed_hours: float) -> dict:
         wear = self.wear_accumulated + self.wear_rate * elapsed_hours
@@ -40,32 +151,43 @@ class BearingSimulator:
         t = time.time()
         daily_cycle = math.sin(t / 86400 * 2 * math.pi) * 5.0
         temp = self.base_temp + daily_cycle + random.gauss(0, 1.5) + wear * 0.02
-        temp = max(15, min(85, temp))
 
         water_flow = max(0.3, 1.0 + 0.3 * math.sin(t / 3600 * 2 * math.pi))
-        load = self.base_load * water_flow * wear_factor + random.gauss(0, 300)
-        load = max(500, min(20000, load))
+        load = (
+            self.load_cfg["base_load"] * water_flow * wear_factor
+            + random.gauss(0, self.load_cfg["load_noise"])
+        )
+        if random.random() < self.load_cfg["load_peak_prob"]:
+            peak_range = self.load_cfg["load_peak_range"]
+            load *= random.uniform(*peak_range)
+        load = max(self.load_cfg["load_min"], min(self.load_cfg["load_max"], load))
+        temp += (load / self.load_cfg["base_load"] - 1.0) * 5.0
 
-        speed = self.base_speed * math.sqrt(water_flow) * (1.0 - wear * 0.002)
-        speed += random.gauss(0, 0.8)
-        speed = max(2, min(50, speed))
+        speed = (
+            self.speed_cfg["base_speed"] * math.sqrt(water_flow)
+            * (1.0 - wear * 0.002)
+        )
+        speed += random.gauss(0, self.speed_cfg["speed_noise"])
+        if self.speed_cfg.get("speed_surge_prob", 0) > 0:
+            if random.random() < self.speed_cfg["speed_surge_prob"]:
+                speed *= random.uniform(*self.speed_cfg["speed_surge_range"])
+        speed = max(self.speed_cfg["speed_min"], min(self.speed_cfg["speed_max"], speed))
 
         ehl_factor = (
-            (temp / 40.0) ** -0.5
-            * (speed / 15.0) ** 0.7
-            * (load / 5000.0) ** -0.3
+            (max(20, temp) / 40.0) ** -0.5
+            * (speed / self.speed_cfg["base_speed"]) ** 0.7
+            * (load / self.load_cfg["base_load"]) ** -0.3
         )
         film = self.base_film * ehl_factor
         film -= wear * 0.015
         film += random.gauss(0, 0.15)
-        film = max(0.1, min(8.0, film))
 
         if random.random() < 0.005:
             film *= random.uniform(0.1, 0.4)
             temp += random.uniform(5, 15)
 
-        if random.random() < 0.003:
-            load *= random.uniform(1.5, 2.5)
+        temp = max(15, min(100, temp))
+        film = max(0.05, min(8.0, film))
 
         self.wear_accumulated = wear
 
@@ -73,319 +195,176 @@ class BearingSimulator:
             "bearing_id": self.bearing_id,
             "bearing_code": self.bearing_code,
             "position": self.position,
+            "load_profile": self.load_profile,
+            "speed_profile": self.speed_profile,
             "temperature": round(temp, 4),
             "radial_load": round(load, 4),
             "rotational_speed": round(speed, 4),
             "oil_film_thickness": round(film, 6),
+            "wear_accumulated_um": round(wear, 6),
+            "elapsed_hours": round(elapsed_hours, 4),
             "timestamp": datetime.now().isoformat(),
-            "wear_accumulated_um": round(wear, 4),
         }
 
 
-class ModbusTCPClient:
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self.sock = None
-        self.transaction_id = 0
-
-    def connect(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(5)
-        try:
-            self.sock.connect((self.host, self.port))
-            print(f"[Modbus] 已连接到 {self.host}:{self.port}")
-            return True
-        except Exception as e:
-            print(f"[Modbus] 连接失败: {e}")
-            return False
-
-    def close(self):
-        if self.sock:
-            self.sock.close()
-            self.sock = None
-
-    def _build_mbap(self, length: int, unit_id: int = 1) -> bytes:
-        self.transaction_id = (self.transaction_id + 1) % 65536
-        header = struct.pack(">HHHB", self.transaction_id, 0, length, unit_id)
-        return header
-
-    def write_multiple_registers(
-        self,
-        start_addr: int,
-        values: list,
-        unit_id: int = 1,
-    ) -> bool:
-        float_bytes = b""
-        for v in values:
-            float_bytes += struct.pack(">f", float(v))
-
-        num_regs = len(float_bytes) // 2
-        byte_count = len(float_bytes)
-
-        pdu = struct.pack(
-            ">BHHB",
-            0x10,
-            start_addr,
-            num_regs,
-            byte_count,
-        ) + float_bytes
-
-        mbap = self._build_mbap(len(pdu) + 1, unit_id)
-        request = mbap + pdu
-
-        try:
-            self.sock.sendall(request)
-            response = self.sock.recv(256)
-            if len(response) >= 12:
-                return True
-            return False
-        except Exception as e:
-            print(f"[Modbus] 写入失败: {e}")
-            return False
+def encode_float32(value: float) -> bytes:
+    return struct.pack(">f", value)
 
 
-class SensorSimulator:
-    def __init__(self, config: dict):
-        self.host = config.get("modbus_host", "localhost")
-        self.port = config.get("modbus_port", 5020)
-        self.interval = config.get("interval_seconds", 60)
-        self.api_url = config.get("api_url", "http://localhost:8080")
-        self.use_modbus = config.get("use_modbus", True)
-        self.use_api = config.get("use_api", False)
-        self.verbose = config.get("verbose", True)
-
-        self.bearings = []
-        self.modbus_client = ModbusTCPClient(self.host, self.port)
-        self.running = False
-        self.start_time = time.time()
-
-        for i, b in enumerate(config.get("bearings", [])):
-            sim = BearingSimulator(
-                bearing_id=b.get("id", i + 1),
-                modbus_addr=b.get("modbus_addr", i * 10),
-                bearing_code=b.get("code", f"BR-{i+1:03d}"),
-                position=b.get("position", f"位置{i+1}"),
-                base_temp=b.get("base_temp", 35.0),
-                base_load=b.get("base_load", 5000.0),
-                base_speed=b.get("base_speed", 15.0),
-                base_film=b.get("base_film", 3.5),
-                wear_rate=b.get("wear_rate", 0.003),
-            )
-            self.bearings.append(sim)
-
-    def _send_via_modbus(self, bearing: BearingSimulator, data: dict) -> bool:
-        if self.modbus_client.sock is None:
-            if not self.modbus_client.connect():
-                time.sleep(5)
-                return False
-
-        values = [
-            data["temperature"],
-            data["radial_load"],
-            data["rotational_speed"],
-            data["oil_film_thickness"],
-        ]
-
-        success = self.modbus_client.write_multiple_registers(
-            bearing.modbus_addr, values
-        )
-        if not success:
-            self.modbus_client.close()
-        return success
-
-    def _send_via_api(self, data: dict) -> bool:
-        try:
-            import urllib.request
-
-            payload = {
-                "time": data["timestamp"],
-                "bearing_id": data["bearing_id"],
-                "temperature": data["temperature"],
-                "radial_load": data["radial_load"],
-                "rotational_speed": data["rotational_speed"],
-                "oil_film_thickness": data["oil_film_thickness"],
-                "source": "simulator",
-            }
-            req = urllib.request.Request(
-                f"{self.api_url}/api/v1/sensor-data",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status == 201
-        except Exception as e:
-            print(f"[API] 发送失败: {e}")
-            return False
-
-    def _single_cycle(self):
-        elapsed = (time.time() - self.start_time) / 3600.0
-
-        for bearing in self.bearings:
-            data = bearing.generate_data(elapsed)
-
-            modbus_ok = False
-            api_ok = False
-
-            if self.use_modbus:
-                modbus_ok = self._send_via_modbus(bearing, data)
-
-            if self.use_api:
-                api_ok = self._send_via_api(data)
-
-            if self.verbose:
-                status_parts = []
-                if self.use_modbus:
-                    status_parts.append(f"Modbus={'✓' if modbus_ok else '✗'}")
-                if self.use_api:
-                    status_parts.append(f"API={'✓' if api_ok else '✗'}")
-                status = " | ".join(status_parts)
-
-                print(
-                    f"[{datetime.now().strftime('%H:%M:%S')}] "
-                    f"{bearing.bearing_code} ({bearing.position}) "
-                    f"温度={data['temperature']:.2f}°C "
-                    f"载荷={data['radial_load']:.1f}N "
-                    f"转速={data['rotational_speed']:.2f}RPM "
-                    f"油膜={data['oil_film_thickness']:.4f}μm "
-                    f"磨损={data['wear_accumulated_um']:.3f}μm "
-                    f"[{status}]"
-                )
-
-    def run(self):
-        self.running = True
-        print("=" * 80)
-        print("  古代水转筒车轴承传感器模拟器")
-        print(f"  Modbus服务器: {self.host}:{self.port}")
-        print(f"  API服务器: {self.api_url}")
-        print(f"  上报间隔: {self.interval}秒")
-        print(f"  模拟轴承数量: {len(self.bearings)}")
-        print("=" * 80)
-
-        for b in self.bearings:
-            print(f"    - {b.bearing_code}: {b.position}, Modbus地址={b.modbus_addr}")
-        print()
-
-        try:
-            while self.running:
-                cycle_start = time.time()
-                self._single_cycle()
-                elapsed = time.time() - cycle_start
-                sleep_time = max(0, self.interval - elapsed)
-                time.sleep(sleep_time)
-        except KeyboardInterrupt:
-            print("\n\n模拟器已停止")
-        finally:
-            self.running = False
-            self.modbus_client.close()
+def build_modbus_tcp_packet(transaction_id: int, unit_id: int, values: list) -> bytes:
+    quantity = len(values)
+    pdu = bytes([unit_id, 0x10, 0x00, 0x00, (quantity >> 8) & 0xFF, quantity & 0xFF, quantity * 2])
+    for v in values:
+        pdu += encode_float32(v)
+    mbap = struct.pack(">HHHB", transaction_id, 0x0000, len(pdu), unit_id)
+    return mbap + pdu
 
 
-DEFAULT_CONFIG = {
-    "modbus_host": "localhost",
-    "modbus_port": 5020,
-    "api_url": "http://localhost:8080",
-    "interval_seconds": 60,
-    "use_modbus": True,
-    "use_api": False,
-    "verbose": True,
-    "bearings": [
-        {
-            "id": 1,
-            "modbus_addr": 0,
-            "code": "NRW-001-BR-A",
-            "position": "主轴上轴承",
-            "base_temp": 36.0,
-            "base_load": 6500.0,
-            "base_speed": 12.0,
-            "base_film": 3.2,
-            "wear_rate": 0.004,
-        },
-        {
-            "id": 2,
-            "modbus_addr": 10,
-            "code": "NRW-001-BR-B",
-            "position": "主轴下轴承",
-            "base_temp": 38.0,
-            "base_load": 7200.0,
-            "base_speed": 12.0,
-            "base_film": 2.8,
-            "wear_rate": 0.005,
-        },
-        {
-            "id": 3,
-            "modbus_addr": 20,
-            "code": "NRW-002-BR-A",
-            "position": "主轴轴承",
-            "base_temp": 33.0,
-            "base_load": 4800.0,
-            "base_speed": 18.0,
-            "base_film": 4.0,
-            "wear_rate": 0.0025,
-        },
-    ],
-}
+def send_modbus_tcp(host: str, port: int, unit_id: int, transaction_id: int, values: list):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(3.0)
+    try:
+        sock.connect((host, port))
+        packet = build_modbus_tcp_packet(transaction_id, unit_id, values)
+        sock.sendall(packet)
+        return True
+    except Exception as e:
+        print(f"[ERR] Modbus发送失败: {e}")
+        return False
+    finally:
+        sock.close()
+
+
+def print_status(bearing: BearingSimulator, data: dict, idx: int, total: int):
+    bar_len = 30
+    load_pct = min(1.0, data["radial_load"] / LOAD_PROFILES[bearing.load_profile]["load_max"])
+    filled = int(bar_len * load_pct)
+    bar = "#" * filled + "-" * (bar_len - filled)
+
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(
+        f"[{ts}] [{idx}/{total}] {bearing.bearing_code} "
+        f"载荷={data['radial_load']:>7.0f}N [{bar}] "
+        f"转速={data['rotational_speed']:>5.1f}RPM "
+        f"温度={data['temperature']:>5.1f}°C "
+        f"油膜={data['oil_film_thickness']:>5.2f}μm "
+        f"磨损={data['wear_accumulated_um']:>6.3f}μm "
+        f"工况={bearing.load_profile}/{bearing.speed_profile}"
+    )
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="水转筒车轴承Modbus传感器模拟器")
+    p.add_argument("--host", default="127.0.0.1", help="Modbus TCP服务端地址")
+    p.add_argument("--port", type=int, default=5020, help="Modbus TCP端口")
+    p.add_argument("--bearing-id", type=int, default=1, help="轴承ID（单轴承模式）")
+    p.add_argument("--interval", type=float, default=3600, help="上报间隔秒数（默认3600，即1小时）")
+    p.add_argument(
+        "--load-profile",
+        choices=list(LOAD_PROFILES.keys()),
+        default="normal",
+        help="载荷工况: " + ", ".join(f"{k}={v['desc']}" for k, v in LOAD_PROFILES.items()),
+    )
+    p.add_argument(
+        "--speed-profile",
+        choices=list(SPEED_PROFILES.keys()),
+        default="normal",
+        help="转速工况: " + ", ".join(f"{k}={v['desc']}" for k, v in SPEED_PROFILES.items()),
+    )
+    p.add_argument("--count", type=int, default=0, help="运行次数（0为无限循环）")
+    p.add_argument("--once", action="store_true", help="只发送一次数据后退出")
+    p.add_argument("--list-profiles", action="store_true", help="列出所有工况配置")
+    p.add_argument("--fast", action="store_true", help="快速模式：间隔1秒模拟1小时数据（加速仿真）")
+    p.add_argument("--json", action="store_true", help="输出JSON格式数据到stdout")
+    return p.parse_args()
+
+
+def list_profiles():
+    print("=" * 70)
+    print("可用载荷工况 (--load-profile)")
+    print("=" * 70)
+    for k, v in LOAD_PROFILES.items():
+        print(f"  {k:<8} {v['name']:<10} 基准={v['base_load']:>6.0f}N 磨损率={v['wear_rate']:.4f}  {v['desc']}")
+    print()
+    print("=" * 70)
+    print("可用转速工况 (--speed-profile)")
+    print("=" * 70)
+    for k, v in SPEED_PROFILES.items():
+        print(f"  {k:<8} {v['name']:<10} 基准={v['base_speed']:>5.1f}RPM  {v['desc']}")
+    print()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="古代水转筒车轴承传感器模拟器 (Modbus TCP)"
-    )
-    parser.add_argument(
-        "--modbus-host", default="localhost", help="Modbus TCP服务器地址"
-    )
-    parser.add_argument(
-        "--modbus-port", type=int, default=5020, help="Modbus TCP服务器端口"
-    )
-    parser.add_argument(
-        "--api-url", default="http://localhost:8080", help="后端API地址"
-    )
-    parser.add_argument(
-        "--interval", type=int, default=60, help="上报间隔秒数（默认60秒）"
-    )
-    parser.add_argument(
-        "--fast", action="store_true", help="快速模式，间隔1秒（用于测试）"
-    )
-    parser.add_argument(
-        "--use-api", action="store_true", help="同时通过REST API发送数据"
-    )
-    parser.add_argument(
-        "--no-modbus", action="store_true", help="禁用Modbus TCP（仅使用API）"
-    )
-    parser.add_argument(
-        "--config", type=str, help="JSON配置文件路径"
-    )
-    parser.add_argument(
-        "--quiet", action="store_true", help="静默模式，减少输出"
+    args = parse_args()
+
+    if args.list_profiles:
+        list_profiles()
+        return 0
+
+    interval = 1.0 if args.fast else args.interval
+    sim_speed = 3600.0 if args.fast else 1.0
+
+    print("=" * 70)
+    print("水转筒车轴承Modbus传感器模拟器")
+    print("=" * 70)
+    print(f"  Modbus目标:      {args.host}:{args.port}")
+    print(f"  轴承ID:          {args.bearing_id}")
+    print(f"  载荷工况:        {args.load_profile} - {LOAD_PROFILES[args.load_profile]['desc']}")
+    print(f"  转速工况:        {args.speed_profile} - {SPEED_PROFILES[args.speed_profile]['desc']}")
+    print(f"  上报间隔:        {interval}s {'(快速模式: 1s≈1h)' if args.fast else ''}")
+    print(f"  运行次数:        {'无限' if args.count == 0 and not args.once else (1 if args.once else args.count)}")
+    print("=" * 70)
+    print()
+
+    bearing = BearingSimulator(
+        bearing_id=args.bearing_id,
+        modbus_addr=args.bearing_id * 10,
+        bearing_code=f"SIM-{args.bearing_id:03d}",
+        position="模拟主轴轴承",
+        load_profile=args.load_profile,
+        speed_profile=args.speed_profile,
     )
 
-    args = parser.parse_args()
+    txn_id = 1
+    count = 0
+    start = time.time()
 
-    config = dict(DEFAULT_CONFIG)
+    try:
+        while True:
+            elapsed_hours = (time.time() - start) * sim_speed / 3600.0
+            data = bearing.generate_data(elapsed_hours)
 
-    if args.config:
-        try:
-            with open(args.config, "r", encoding="utf-8") as f:
-                user_config = json.load(f)
-                config.update(user_config)
-        except Exception as e:
-            print(f"加载配置文件失败: {e}")
+            if args.json:
+                print(json.dumps(data, ensure_ascii=False))
+                sys.stdout.flush()
+            else:
+                print_status(bearing, data, count + 1, args.count if args.count > 0 else 9999)
 
-    config["modbus_host"] = args.modbus_host
-    config["modbus_port"] = args.modbus_port
-    config["api_url"] = args.api_url
-    config["interval_seconds"] = 1 if args.fast else args.interval
-    config["use_modbus"] = not args.no_modbus
-    config["use_api"] = args.use_api
-    config["verbose"] = not args.quiet
+            values = [
+                float(data["temperature"]),
+                float(data["radial_load"]),
+                float(data["rotational_speed"]),
+                float(data["oil_film_thickness"]),
+                float(args.bearing_id),
+            ]
+            send_modbus_tcp(args.host, args.port, bearing.modbus_addr & 0xFF, txn_id, values)
+            txn_id = (txn_id + 1) & 0xFFFF
 
-    if not config["use_modbus"] and not config["use_api"]:
-        print("错误: 必须启用至少一种数据发送方式 (Modbus或API)")
-        return
+            count += 1
+            if args.once:
+                break
+            if args.count > 0 and count >= args.count:
+                break
 
-    sim = SensorSimulator(config)
-    sim.run()
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        print()
+        print(f"[INFO] 用户中止，共发送 {count} 次数据")
+
+    print(f"[DONE] 模拟完成，累计发送 {count} 次，累计磨损 {bearing.wear_accumulated:.3f}μm")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
