@@ -10,6 +10,13 @@ const BearingView = {
     },
     animationFrame: 0,
     animating: false,
+    offscreenCanvas: null,
+    offscreenCtx: null,
+    metalPattern: null,
+    wearPattern: null,
+    innerPattern: null,
+    lastRenderedState: null,
+    shaftAngle: 0,
 
     init(canvasId) {
         this.canvas = document.getElementById(canvasId);
@@ -22,7 +29,120 @@ const BearingView = {
         this._resizeCanvas();
         window.addEventListener("resize", () => this._resizeCanvas());
 
+        this._initOffscreenCanvases();
+
         this.animate();
+    },
+
+    _initOffscreenCanvases() {
+        this.offscreenCanvas = document.createElement("canvas");
+        this.offscreenCanvas.width = 512;
+        this.offscreenCanvas.height = 512;
+        this.offscreenCtx = this.offscreenCanvas.getContext("2d");
+
+        this._buildMetalPattern();
+        this._buildInnerPattern();
+    },
+
+    _buildMetalPattern() {
+        const size = 64;
+        const c = document.createElement("canvas");
+        c.width = size;
+        c.height = size;
+        const ctx = c.getContext("2d");
+
+        const grad = ctx.createLinearGradient(0, 0, size, size);
+        grad.addColorStop(0, "#9e9e9e");
+        grad.addColorStop(0.2, "#bdbdbd");
+        grad.addColorStop(0.5, "#a0a0a0");
+        grad.addColorStop(0.8, "#757575");
+        grad.addColorStop(1, "#8a8a8a");
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, size, size);
+
+        for (let i = 0; i < 200; i++) {
+            const x = Math.random() * size;
+            const y = Math.random() * size;
+            const brightness = 120 + Math.random() * 60;
+            ctx.fillStyle = `rgba(${brightness}, ${brightness}, ${brightness}, 0.3)`;
+            ctx.fillRect(x, y, 1 + Math.random() * 2, 1);
+        }
+
+        for (let angle = 0; angle < Math.PI * 2; angle += Math.PI / 16) {
+            ctx.strokeStyle = "rgba(100, 100, 100, 0.15)";
+            ctx.lineWidth = 0.5;
+            ctx.beginPath();
+            ctx.moveTo(size / 2, size / 2);
+            ctx.lineTo(
+                size / 2 + Math.cos(angle) * size,
+                size / 2 + Math.sin(angle) * size
+            );
+            ctx.stroke();
+        }
+
+        this.metalPattern = this.ctx.createPattern(c, "repeat");
+    },
+
+    _buildInnerPattern() {
+        const size = 48;
+        const c = document.createElement("canvas");
+        c.width = size;
+        c.height = size;
+        const ctx = c.getContext("2d");
+
+        const grad = ctx.createLinearGradient(0, 0, 0, size);
+        grad.addColorStop(0, "#d8d8d8");
+        grad.addColorStop(0.3, "#f0f0f0");
+        grad.addColorStop(0.7, "#e8e8e8");
+        grad.addColorStop(1, "#c8c8c8");
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, size, size);
+
+        for (let i = 0; i < 100; i++) {
+            const x = Math.random() * size;
+            const y = Math.random() * size;
+            const b = 200 + Math.random() * 55;
+            ctx.fillStyle = `rgba(${b}, ${b}, ${b}, 0.25)`;
+            ctx.fillRect(x, y, 1, 1 + Math.random());
+        }
+
+        this.innerPattern = this.ctx.createPattern(c, "repeat");
+    },
+
+    _buildWearPattern(wearRatio) {
+        const size = 64;
+        const c = document.createElement("canvas");
+        c.width = size;
+        c.height = size;
+        const ctx = c.getContext("2d");
+
+        const wearColor = ColorMap.heatColor(wearRatio);
+        ctx.fillStyle = ColorMap.toRgba(wearColor, 0.6);
+        ctx.fillRect(0, 0, size, size);
+
+        for (let i = 0; i < 150; i++) {
+            const x = Math.random() * size;
+            const y = Math.random() * size;
+            const intensity = 0.2 + Math.random() * 0.6;
+            ctx.fillStyle = ColorMap.toRgba(wearColor, intensity);
+            const w = 1 + Math.random() * 4;
+            const h = 1 + Math.random() * 2;
+            ctx.fillRect(x, y, w, h);
+        }
+
+        for (let angle = 0; angle < Math.PI * 2; angle += Math.PI / 12) {
+            ctx.strokeStyle = ColorMap.toRgba(wearColor, 0.15);
+            ctx.lineWidth = 0.5;
+            ctx.beginPath();
+            ctx.moveTo(size / 2, size / 2);
+            ctx.lineTo(
+                size / 2 + Math.cos(angle) * size,
+                size / 2 + Math.sin(angle) * size
+            );
+            ctx.stroke();
+        }
+
+        this.wearPattern = this.ctx.createPattern(c, "repeat");
     },
 
     _resizeCanvas() {
@@ -37,26 +157,29 @@ const BearingView = {
 
         this._width = rect.width;
         this._height = rect.height;
+
+        if (this.metalPattern) this._buildMetalPattern();
+        if (this.innerPattern) this._buildInnerPattern();
     },
 
     setBearing(bearing) {
         this.bearing = bearing;
-        this.render();
     },
 
     setWearResult(result) {
         this.wearResult = result;
-        this.render();
+        if (result && this.bearing) {
+            const wearRatio = Math.min(1, result.total_wear_microm / (this.bearing.wear_limit_microm || 100));
+            this._buildWearPattern(wearRatio);
+        }
     },
 
     setSensorData(data) {
         this.sensorData = data;
-        this.render();
     },
 
     setOption(key, value) {
         this.options[key] = value;
-        this.render();
     },
 
     render() {
@@ -90,6 +213,8 @@ const BearingView = {
         }
 
         this._drawLabels(ctx, cx, cy, scale);
+
+        this.shaftAngle += 0.03;
     },
 
     _drawBackground(ctx, W, H) {
@@ -141,19 +266,30 @@ const BearingView = {
         ctx.save();
         ctx.translate(cx, cy);
 
-        const outerGradient = ctx.createLinearGradient(0, -outerR, 0, outerR);
-        outerGradient.addColorStop(0, "#9e9e9e");
-        outerGradient.addColorStop(0.3, "#bdbdbd");
-        outerGradient.addColorStop(0.7, "#757575");
-        outerGradient.addColorStop(1, "#616161");
-
-        ctx.fillStyle = outerGradient;
-        ctx.beginPath();
-        ctx.roundRect(-outerR, -widthPx / 2, outerR * 2, widthPx, 8);
-        ctx.fill();
+        if (this.metalPattern) {
+            ctx.save();
+            ctx.translate(-outerR, -widthPx / 2);
+            ctx.fillStyle = this.metalPattern;
+            ctx.beginPath();
+            ctx.roundRect(0, 0, outerR * 2, widthPx, 8);
+            ctx.fill();
+            ctx.restore();
+        } else {
+            const outerGradient = ctx.createLinearGradient(0, -outerR, 0, outerR);
+            outerGradient.addColorStop(0, "#9e9e9e");
+            outerGradient.addColorStop(0.3, "#bdbdbd");
+            outerGradient.addColorStop(0.7, "#757575");
+            outerGradient.addColorStop(1, "#616161");
+            ctx.fillStyle = outerGradient;
+            ctx.beginPath();
+            ctx.roundRect(-outerR, -widthPx / 2, outerR * 2, widthPx, 8);
+            ctx.fill();
+        }
 
         ctx.strokeStyle = "#424242";
         ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.roundRect(-outerR, -widthPx / 2, outerR * 2, widthPx, 8);
         ctx.stroke();
 
         let innerX1 = -innerR;
@@ -162,33 +298,59 @@ const BearingView = {
         const innerY2 = widthPx / 2 - 10;
 
         if (wearRatio > 0) {
-            const wearColor = ColorMap.heatColor(wearRatio);
-            const wearGradient = ctx.createRadialGradient(0, 0, innerR - wearDepth, 0, 0, innerR);
-            wearGradient.addColorStop(0, ColorMap.toRgba(wearColor, 0.9));
-            wearGradient.addColorStop(1, ColorMap.toRgba(wearColor, 0.4));
+            ctx.save();
 
-            ctx.fillStyle = wearGradient;
+            if (this.wearPattern) {
+                const patternTransform = new DOMMatrix();
+                patternTransform.rotateSelf(this.shaftAngle * 180 / Math.PI);
+                this.wearPattern.setTransform(patternTransform);
+
+                ctx.fillStyle = this.wearPattern;
+            } else {
+                const wearColor = ColorMap.heatColor(wearRatio);
+                const wearGradient = ctx.createRadialGradient(0, 0, innerR - wearDepth, 0, 0, innerR);
+                wearGradient.addColorStop(0, ColorMap.toRgba(wearColor, 0.9));
+                wearGradient.addColorStop(1, ColorMap.toRgba(wearColor, 0.4));
+                ctx.fillStyle = wearGradient;
+            }
+
             ctx.beginPath();
-            ctx.ellipse(0, 0, innerR, widthPx / 2 - 5, 0, 0, Math.PI * 2);
+            ctx.ellipse(0, 0, innerR + wearDepth / 2, widthPx / 2 - 5, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        ctx.save();
+        ctx.rotate(this.shaftAngle * 0.3);
+
+        if (this.innerPattern) {
+            ctx.save();
+            ctx.translate(innerX1 + wearDepth, innerY1);
+            ctx.fillStyle = this.innerPattern;
+            ctx.beginPath();
+            ctx.roundRect(0, 0, (innerX2 - innerX1) - wearDepth * 2, innerY2 - innerY1, 4);
+            ctx.fill();
+            ctx.restore();
+        } else {
+            const innerGradient = ctx.createLinearGradient(0, innerY1, 0, innerY2);
+            innerGradient.addColorStop(0, "#e0e0e0");
+            innerGradient.addColorStop(0.5, "#f5f5f5");
+            innerGradient.addColorStop(1, "#bdbdbd");
+            ctx.fillStyle = innerGradient;
+            ctx.beginPath();
+            ctx.roundRect(innerX1 + wearDepth, innerY1, (innerX2 - innerX1) - wearDepth * 2, innerY2 - innerY1, 4);
             ctx.fill();
         }
 
-        const innerGradient = ctx.createLinearGradient(0, innerY1, 0, innerY2);
-        innerGradient.addColorStop(0, "#e0e0e0");
-        innerGradient.addColorStop(0.5, "#f5f5f5");
-        innerGradient.addColorStop(1, "#bdbdbd");
-
-        ctx.fillStyle = innerGradient;
-        ctx.beginPath();
-        ctx.roundRect(innerX1 + wearDepth, innerY1, (innerX2 - innerX1) - wearDepth * 2, innerY2 - innerY1, 4);
-        ctx.fill();
-
         ctx.strokeStyle = "#9e9e9e";
         ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.roundRect(innerX1 + wearDepth, innerY1, (innerX2 - innerX1) - wearDepth * 2, innerY2 - innerY1, 4);
         ctx.stroke();
 
         if (this.options.showWear && wearRatio > 0) {
-            ctx.strokeStyle = ColorMap.heatColor(wearRatio);
+            ctx.strokeStyle = ColorMap.toRgb(ColorMap.heatColor(wearRatio));
             ctx.lineWidth = 3;
             ctx.setLineDash([5, 3]);
             ctx.beginPath();
@@ -197,6 +359,8 @@ const BearingView = {
             ctx.setLineDash([]);
         }
 
+        ctx.restore();
+
         let filmThickness = 3;
         if (this.sensorData) {
             filmThickness = this.sensorData.oil_film_thickness || 3;
@@ -204,9 +368,19 @@ const BearingView = {
         const filmAlpha = Math.min(0.8, filmThickness / 5);
 
         const filmColor = ColorMap.oilFilm(filmThickness / 8);
-        ctx.fillStyle = ColorMap.toRgba(filmColor, filmAlpha);
-        ctx.fillRect(innerX1 - 3, innerY1 + 2, 3, innerY2 - innerY1 - 4);
-        ctx.fillRect(innerX2, innerY1 + 2, 3, innerY2 - innerY1 - 4);
+
+        ctx.save();
+        ctx.rotate(this.shaftAngle * 0.15);
+
+        const filmWidth = 4;
+        for (let y = innerY1 + 2; y < innerY2 - 2; y += 3) {
+            const shimmer = Math.sin(y * 0.1 + this.shaftAngle * 2) * 0.2;
+            ctx.fillStyle = ColorMap.toRgba(filmColor, Math.max(0.1, filmAlpha + shimmer));
+            ctx.fillRect(innerX1 - filmWidth, y, filmWidth, 2);
+            ctx.fillRect(innerX2, y, filmWidth, 2);
+        }
+
+        ctx.restore();
 
         ctx.fillStyle = "#424242";
         ctx.beginPath();
@@ -219,14 +393,24 @@ const BearingView = {
         ctx.arc(0, 0, 5, 0, Math.PI * 2);
         ctx.stroke();
 
-        this.animationFrame += 0.02;
-        const shaftAngle = this.animationFrame;
-        ctx.strokeStyle = "rgba(102, 187, 106, 0.6)";
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(0, 0);
-        ctx.lineTo(Math.cos(shaftAngle) * (innerR - 10), Math.sin(shaftAngle) * (innerR - 10));
-        ctx.stroke();
+        ctx.save();
+        ctx.rotate(this.shaftAngle);
+
+        const numSpokes = 4;
+        for (let i = 0; i < numSpokes; i++) {
+            const angle = (i / numSpokes) * Math.PI * 2;
+            ctx.strokeStyle = `rgba(102, 187, 106, ${0.3 + 0.3 * Math.abs(Math.cos(angle + this.shaftAngle))})`;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.lineTo(
+                Math.cos(angle) * (innerR - 10),
+                Math.sin(angle) * (innerR - 10)
+            );
+            ctx.stroke();
+        }
+
+        ctx.restore();
 
         ctx.restore();
     },
