@@ -8,10 +8,20 @@ import (
 	"noria-bearing-system/internal/models"
 )
 
-type LifePredictor struct{}
+type LifePredictor struct {
+	priorShapeAlpha float64
+	priorShapeBeta  float64
+	priorScaleAlpha float64
+	priorScaleBeta  float64
+}
 
 func NewLifePredictor() *LifePredictor {
-	return &LifePredictor{}
+	return &LifePredictor{
+		priorShapeAlpha: config.AppConfig.LifePred.WeibullDefaultShape * 2.0,
+		priorShapeBeta:  2.0,
+		priorScaleAlpha: 2.0,
+		priorScaleBeta:  config.AppConfig.LifePred.WeibullDefaultScale,
+	}
 }
 
 type LifePredInput struct {
@@ -99,8 +109,8 @@ func (lp *LifePredictor) Predict(input *LifePredInput) *LifePredOutput {
 	}
 	failureProbability := 1.0 - reliability
 
-	confidenceLow := predictedRUL * 0.7
-	confidenceHigh := predictedRUL * 1.3
+	confidenceLow := predictedRUL * (1.0 - 0.3*math.Exp(-float64(len(wearRates))/20.0))
+	confidenceHigh := predictedRUL * (1.0 + 0.3*math.Exp(-float64(len(wearRates))/20.0))
 
 	return &LifePredOutput{
 		WeibullShape:           weibullShape,
@@ -121,38 +131,64 @@ func (lp *LifePredictor) estimateWeibullParameters(
 	currentWear float64,
 	runningHours float64,
 ) (float64, float64) {
-	defaultShape := config.AppConfig.LifePred.WeibullDefaultShape
-	defaultScale := config.AppConfig.LifePred.WeibullDefaultScale
+	priorShape := lp.priorShapeAlpha / lp.priorShapeBeta
+	priorScale := lp.priorScaleBeta
 
-	if len(wearRates) >= config.AppConfig.LifePred.MinSamplesForFit {
-		shape, scale, ok := fitWeibull(wearRates)
-		if ok {
-			if shape < 1.0 {
-				shape = 1.0
+	n := len(wearRates)
+
+	mleShape, mleScale := priorShape, priorScale
+	if n >= 3 {
+		if shape, scale, ok := fitWeibull(wearRates); ok {
+			if shape >= 0.5 && shape <= 6.0 && scale > 0 {
+				mleShape = shape
+				mleScale = scale
 			}
-			if shape > 5.0 {
-				shape = 5.0
-			}
-			if scale < 1000 {
-				scale = bearing.RatedLifeHours * 0.5
-			}
-			return shape, scale
 		}
 	}
 
-	shape := defaultShape
-	scale := defaultScale
-
 	if runningHours > 0 && currentWear > 0 {
 		projectedLifeHours := runningHours * bearing.WearLimitMicrom / currentWear
-		scale = projectedLifeHours / math.Pow(math.Log(2.0), 1.0/shape)
+		if projectedLifeHours > 0 {
+			projectedScale := projectedLifeHours / math.Pow(math.Log(2.0), 1.0/priorShape)
+			if projectedScale > 0 && math.IsFinite(projectedScale) {
+				mleScale = projectedScale
+			}
+		}
+	}
+
+	bayesianStrength := float64(n) / (float64(n) + float64(config.AppConfig.LifePred.MinSamplesForFit))
+
+	shape := (1.0-bayesianStrength)*priorShape + bayesianStrength*mleShape
+	if shape < 0.5 {
+		shape = 0.5
+	}
+	if shape > 6.0 {
+		shape = 6.0
+	}
+
+	scale := (1.0-bayesianStrength)*priorScale + bayesianStrength*mleScale
+	if scale < 500 {
+		scale = bearing.RatedLifeHours * 0.3
+	}
+	if scale > bearing.RatedLifeHours*3 {
+		scale = bearing.RatedLifeHours * 3
+	}
+
+	if n > 0 {
+		lp.priorShapeAlpha = lp.priorShapeAlpha + bayesianStrength*0.1
+		lp.priorShapeBeta = lp.priorShapeBeta + 0.1
+		observedShapeMean := lp.priorShapeAlpha / lp.priorShapeBeta
+		if math.Abs(observedShapeMean-shape) > 0.5 {
+			lp.priorShapeAlpha = shape * lp.priorShapeBeta
+		}
+		lp.priorScaleBeta = (1-bayesianStrength*0.05)*lp.priorScaleBeta + bayesianStrength*0.05*scale
 	}
 
 	return shape, scale
 }
 
 func fitWeibull(data []float64) (float64, float64, bool) {
-	if len(data) < 5 {
+	if len(data) < 3 {
 		return 0, 0, false
 	}
 
