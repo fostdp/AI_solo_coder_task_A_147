@@ -1,0 +1,38 @@
+server:
+  port: 8080
+  modbus_port: 5020
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://localhost:8080"
+
+database:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: postgres
+  dbname: noria_bearing
+  sslmode: disable
+
+mqtt:
+  broker: tcp://localhost:1883
+  client_id: noria_bearing_server
+  username: ""
+  password: ""
+  topic_prefix: noria/bearing/alert
+
+wear_calculation:
+  interval_minutes: 60
+  archard_k: 1.0e-8
+  ehl_reference_temp: 40.0
+
+life_prediction:
+  interval_minutes: 360
+  weibull_default_shape: 2.5
+  weibull_default_scale: 50000.0
+  min_samples_for_fit: 20
+
+alert:
+  wear_warning_ratio: 0.7
+  wear_critical_ratio: 0.9
+  oil_film_minimum: 0.5
+  cooldown_minutes: 30
