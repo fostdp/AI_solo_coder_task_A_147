@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>古代水转筒车轴承磨损仿真与寿命预测系统</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <header class="main-header">
+        <div class="header-content">
+            <div class="logo-area">
+                <div class="logo-icon">⚙️</div>
+                <div class="title-group">
+                    <h1>古代水转筒车轴承磨损仿真与寿命预测系统</h1>
+                    <p class="subtitle">Ancient Noria Wheel Bearing Wear Simulation & Life Prediction System</p>
+                </div>
+            </div>
+            <div class="header-stats">
+                <div class="stat-item">
+                    <span class="stat-label">在线轴承</span>
+                    <span class="stat-value" id="stat-bearings">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">告警</span>
+                    <span class="stat-value alert-value" id="stat-alerts">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">系统时间</span>
+                    <span class="stat-value" id="stat-time">--:--:--</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <nav class="main-nav">
+        <button class="nav-btn active" data-view="overview">总览</button>
+        <button class="nav-btn" data-view="3d">三维模型</button>
+        <button class="nav-btn" data-view="bearing">轴承剖面</button>
+        <button class="nav-btn" data-view="oilfilm">油膜云图</button>
+        <button class="nav-btn" data-view="prediction">寿命预测</button>
+        <button class="nav-btn" data-view="alerts">告警记录</button>
+    </nav>
+
+    <main class="main-content">
+        <section class="view-section active" id="view-overview">
+            <div class="overview-grid">
+                <div class="card noria-selector-card">
+                    <h2>筒车选择</h2>
+                    <select id="noria-select" class="select-input">
+                        <option value="">加载中...</option>
+                    </select>
+                    <div class="noria-info" id="noria-info">
+                        <p class="info-label">选择筒车查看详情</p>
+                    </div>
+                </div>
+
+                <div class="card bearings-status-card">
+                    <h2>轴承健康状态</h2>
+                    <div class="bearings-list" id="bearings-list">
+                        <p class="loading-text">加载轴承数据...</p>
+                    </div>
+                </div>
+
+                <div class="card live-data-card">
+                    <h2>实时数据监控</h2>
+                    <div class="data-grid" id="live-data-grid">
+                        <div class="data-tile">
+                            <span class="data-label">轴承温度</span>
+                            <span class="data-value" id="live-temp">--</span>
+                            <span class="data-unit">°C</span>
+                        </div>
+                        <div class="data-tile">
+                            <span class="data-label">径向载荷</span>
+                            <span class="data-value" id="live-load">--</span>
+                            <span class="data-unit">N</span>
+                        </div>
+                        <div class="data-tile">
+                            <span class="data-label">转速</span>
+                            <span class="data-value" id="live-speed">--</span>
+                            <span class="data-unit">RPM</span>
+                        </div>
+                        <div class="data-tile">
+                            <span class="data-label">油膜厚度</span>
+                            <span class="data-value" id="live-film">--</span>
+                            <span class="data-unit">μm</span>
+                        </div>
+                        <div class="data-tile">
+                            <span class="data-label">累计磨损</span>
+                            <span class="data-value" id="live-wear">--</span>
+                            <span class="data-unit">μm</span>
+                        </div>
+                        <div class="data-tile">
+                            <span class="data-label">剩余寿命</span>
+                            <span class="data-value" id="live-rul">--</span>
+                            <span class="data-unit">小时</span>
+                        </div>
+                    </div>
+                    <div class="chart-container small">
+                        <canvas id="realtime-chart"></canvas>
+                    </div>
+                </div>
+
+                <div class="card recent-alerts-card">
+                    <h2>近期告警</h2>
+                    <div class="alerts-list" id="recent-alerts">
+                        <p class="loading-text">加载告警数据...</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="view-section" id="view-3d">
+            <div class="view-header">
+                <h2>筒车三维模型</h2>
+                <div class="view-controls">
+                    <label>
+                        <input type="checkbox" id="auto-rotate" checked> 自动旋转
+                    </label>
+                    <label>
+                        转速系数:
+                        <input type="range" id="speed-factor" min="0" max="5" step="0.1" value="1">
+                        <span id="speed-value">1.0x</span>
+                    </label>
+                    <button class="btn" id="reset-view">重置视角</button>
+                </div>
+            </div>
+            <div class="three-container">
+                <div id="three-scene"></div>
+                <div class="three-info" id="three-info">
+                    <p>拖动旋转 · 滚轮缩放 · 右键平移</p>
+                </div>
+            </div>
+            <div class="bearing-markers" id="bearing-markers"></div>
+        </section>
+
+        <section class="view-section" id="view-bearing">
+            <div class="view-header">
+                <h2>轴承剖面展示</h2>
+                <div class="view-controls">
+                    <label>
+                        轴承选择:
+                        <select id="bearing-select-profile" class="select-input small"></select>
+                    </label>
+                    <label>
+                        显示磨损:
+                        <input type="checkbox" id="show-wear" checked>
+                    </label>
+                    <label>
+                        显示载荷:
+                        <input type="checkbox" id="show-load" checked>
+                    </label>
+                    <button class="btn" id="calc-now">立即计算</button>
+                </div>
+            </div>
+            <div class="bearing-view-container">
+                <div class="bearing-canvas-wrap">
+                    <canvas id="bearing-canvas" width="800" height="600"></canvas>
+                    <div class="bearing-legend" id="bearing-legend"></div>
+                </div>
+                <div class="bearing-info-panel">
+                    <h3>轴承参数</h3>
+                    <div class="info-rows" id="bearing-info-rows">
+                        <p class="info-placeholder">选择轴承查看详细参数</p>
+                    </div>
+                    <h3>磨损状态</h3>
+                    <div class="progress-section">
+                        <div class="progress-label">
+                            <span>磨损深度</span>
+                            <span id="wear-progress-text">0 / 100 μm</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="wear-progress-fill" style="width: 0%"></div>
+                        </div>
+                    </div>
+                    <h3>历史趋势</h3>
+                    <div class="chart-container">
+                        <canvas id="wear-history-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="view-section" id="view-oilfilm">
+            <div class="view-header">
+                <h2>润滑油膜厚度云图</h2>
+                <div class="view-controls">
+                    <label>
+                        轴承选择:
+                        <select id="bearing-select-film" class="select-input small"></select>
+                    </label>
+                    <label>
+                        视图:
+                        <select id="film-view-type" class="select-input small">
+                            <option value="circular">径向展开</option>
+                            <option value="rectangular">矩形展开</option>
+                            <option value="3d">三维曲面</option>
+                        </select>
+                    </label>
+                    <button class="btn" id="refresh-film">刷新数据</button>
+                </div>
+            </div>
+            <div class="oilfilm-container">
+                <div class="oilfilm-canvas-wrap">
+                    <canvas id="oilfilm-canvas" width="800" height="600"></canvas>
+                </div>
+                <div class="oilfilm-sidebar">
+                    <h3>颜色图例</h3>
+                    <div class="colormap-legend" id="colormap-legend"></div>
+                    <h3>统计数据</h3>
+                    <div class="oilfilm-stats" id="oilfilm-stats"></div>
+                    <h3>润滑状态</h3>
+                    <div class="lubrication-status" id="lubrication-status"></div>
+                </div>
+            </div>
+        </section>
+
+        <section class="view-section" id="view-prediction">
+            <div class="view-header">
+                <h2>寿命预测 (Weibull分布)</h2>
+                <div class="view-controls">
+                    <label>
+                        轴承选择:
+                        <select id="bearing-select-pred" class="select-input small"></select>
+                    </label>
+                    <button class="btn" id="refresh-pred">刷新预测</button>
+                </div>
+            </div>
+            <div class="prediction-grid">
+                <div class="card pred-summary">
+                    <h3>预测结果汇总</h3>
+                    <div class="pred-stats">
+                        <div class="pred-stat-item">
+                            <span class="pred-label">预测剩余寿命</span>
+                            <span class="pred-value" id="pred-rul">-- 小时</span>
+                        </div>
+                        <div class="pred-stat-item">
+                            <span class="pred-label">可靠度</span>
+                            <span class="pred-value" id="pred-reliability">--</span>
+                        </div>
+                        <div class="pred-stat-item">
+                            <span class="pred-label">失效概率</span>
+                            <span class="pred-value" id="pred-failure">--</span>
+                        </div>
+                        <div class="pred-stat-item">
+                            <span class="pred-label">运行时间</span>
+                            <span class="pred-value" id="pred-running">-- 小时</span>
+                        </div>
+                    </div>
+                    <div class="pred-params">
+                        <h4>Weibull 参数</h4>
+                        <p>形状参数 (β): <span id="weibull-shape">--</span></p>
+                        <p>尺度参数 (η): <span id="weibull-scale">--</span> 小时</p>
+                        <p>疲劳损伤: <span id="fatigue-damage">--</span></p>
+                    </div>
+                </div>
+                <div class="card pred-chart-card">
+                    <h3>可靠度曲线</h3>
+                    <div class="chart-container">
+                        <canvas id="reliability-chart"></canvas>
+                    </div>
+                </div>
+                <div class="card pred-chart-card">
+                    <h3>概率密度函数 (PDF)</h3>
+                    <div class="chart-container">
+                        <canvas id="pdf-chart"></canvas>
+                    </div>
+                </div>
+                <div class="card pred-chart-card">
+                    <h3>磨损率趋势</h3>
+                    <div class="chart-container">
+                        <canvas id="weartrend-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="view-section" id="view-alerts">
+            <div class="view-header">
+                <h2>告警记录</h2>
+                <div class="view-controls">
+                    <label>
+                        级别筛选:
+                        <select id="alert-filter" class="select-input small">
+                            <option value="all">全部</option>
+                            <option value="critical">严重</option>
+                            <option value="warning">警告</option>
+                        </select>
+                    </label>
+                    <label>
+                        数量:
+                        <select id="alert-limit" class="select-input small">
+                            <option value="50">50条</option>
+                            <option value="100">100条</option>
+                            <option value="500">500条</option>
+                        </select>
+                    </label>
+                    <button class="btn" id="refresh-alerts">刷新</button>
+                </div>
+            </div>
+            <div class="alerts-table-container">
+                <table class="alerts-table">
+                    <thead>
+                        <tr>
+                            <th>时间</th>
+                            <th>轴承</th>
+                            <th>类型</th>
+                            <th>级别</th>
+                            <th>消息</th>
+                            <th>阈值</th>
+                            <th>实际值</th>
+                            <th>状态</th>
+                        </tr>
+                    </thead>
+                    <tbody id="alerts-table-body">
+                        <tr><td colspan="8" class="loading-text">加载告警数据...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <script src="js/api.js"></script>
+    <script src="js/colormap.js"></script>
+    <script src="js/noria-3d.js"></script>
+    <script src="js/bearing-view.js"></script>
+    <script src="js/oilfilm-view.js"></script>
+    <script src="js/charts.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
