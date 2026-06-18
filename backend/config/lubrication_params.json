@@ -1,0 +1,23 @@
+{
+  "mixed_lubrication": {
+    "sommerfeld_threshold_low": 1e-4,
+    "sommerfeld_threshold_high": 1e-2,
+    "correction_factor_low_sommerfeld": 0.6,
+    "load_severity_exponent": 0.5,
+    "load_severity_reference_n": 10000.0,
+    "asperity_contact_exponent": 2.0,
+    "asperity_effect_factor": 0.3,
+    "boundary_max_contact_ratio": 0.95
+  },
+  "ehl_correction": {
+    "dowson_higginson_coefficient": 3.63,
+    "alternative_formula_coefficient": 2.65,
+    "alternative_formula_threshold_u": 1e-12,
+    "temp_viscosity_exponent": 1.5,
+    "lambda_min_clamp": 0.1,
+    "lambda_max_clamp": 10.0
+  },
+  "oil_film_rupture_threshold_microm": 0.5,
+  "viscosity_index": 95,
+  "pressure_coefficient_alpha": 2.2e-8
+}

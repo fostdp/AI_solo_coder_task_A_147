@@ -12,9 +12,12 @@ import (
 	"noria-bearing-system/internal/api"
 	"noria-bearing-system/internal/config"
 	"noria-bearing-system/internal/database"
-	"noria-bearing-system/internal/modbus"
-	mqttpkg "noria-bearing-system/internal/mqtt"
 	"noria-bearing-system/internal/models"
+	"noria-bearing-system/internal/modules/alarm_mqtt"
+	"noria-bearing-system/internal/modules/life_predictor"
+	"noria-bearing-system/internal/modules/messages"
+	"noria-bearing-system/internal/modules/modbus_receiver"
+	"noria-bearing-system/internal/modules/wear_simulator"
 	"noria-bearing-system/internal/scheduler"
 )
 
@@ -27,7 +30,14 @@ func main() {
 	if err := config.Load(configPath); err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
-	log.Println("配置文件加载成功")
+	log.Println("配置文件加载成功 (含JSON参数文件)")
+	log.Printf("  - 磨损参数: Archard K=%.2e, EHL参考温度=%.1f°C",
+		config.AppConfig.WearParams.ArchardKBase,
+		config.AppConfig.WearParams.EHLReferenceTempCelsius)
+	log.Printf("  - 润滑参数: Sommerfeld阈值=%.1e~%.1e, 油膜破裂阈值=%.2fμm",
+		config.AppConfig.Lubrication.MixedLubrication.SommerfeldThresholdLow,
+		config.AppConfig.Lubrication.MixedLubrication.SommerfeldThresholdHigh,
+		config.AppConfig.Lubrication.OilFilmRuptureThresholdMicrom)
 
 	if err := database.Connect(); err != nil {
 		log.Fatalf("数据库连接失败: %v", err)
@@ -38,36 +48,78 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	alertMgr := mqttpkg.NewAlertManager()
-	if err := alertMgr.Start(); err != nil {
-		log.Printf("MQTT告警客户端启动失败（将继续运行）: %v", err)
-	}
-	defer alertMgr.Stop()
+	channels := messages.NewModuleChannels(100)
+	log.Println("模块通信通道已创建 (缓冲区: 100)")
 
-	sched := scheduler.NewScheduler(alertMgr)
+	alertClient := alarm_mqtt.NewAlertClient(&config.AppConfig.MQTT)
+	if err := alertClient.Connect(ctx); err != nil {
+		log.Printf("MQTT告警客户端启动失败（将继续运行）: %v", err)
+	} else {
+		log.Println("MQTT告警客户端已连接")
+	}
+
+	alertManager := alarm_mqtt.NewAlertManager(
+		channels.AlertChan,
+		alertClient,
+		config.AppConfig.Alert.CooldownMinutes,
+	)
+	alertManager.Start(ctx)
+
+	wearSimulator := wear_simulator.NewWearSimulator(
+		channels.WearRequestChan,
+		channels.WearResultChan,
+	)
+	wearSimulator.Start(ctx)
+	log.Println("磨损仿真器已启动")
+
+	lifePredictor := life_predictor.NewLifePredictor(
+		channels.LifeRequestChan,
+		channels.LifeResultChan,
+	)
+	lifePredictor.Start(ctx)
+	log.Println("寿命预测器已启动")
+
+	sched := scheduler.NewScheduler(channels)
 	sched.Start()
 	defer sched.Stop()
+	log.Println("调度器已启动")
 
-	modbusServer := modbus.NewServer(config.AppConfig.Server.ModbusPort)
+	modbusReceiver := modbus_receiver.NewModbusReceiver(
+		config.AppConfig.Server.ModbusPort,
+		channels.SensorDataChan,
+	)
 
 	bearings, err := database.Instance.GetAllBearings(ctx)
 	if err != nil {
 		log.Printf("获取轴承列表失败: %v", err)
 	} else {
 		for i, b := range bearings {
-			modbusServer.RegisterBearing(uint16(i*10), b.ID)
+			modbusReceiver.RegisterBearing(uint16(i*10), b.ID)
 			log.Printf("注册Modbus地址 %d -> 轴承 %s (ID:%d)", i*10, b.BearingCode, b.ID)
 		}
 	}
 
-	modbusServer.SetDataCallback(func(data *models.SensorData) {
-		log.Printf("Modbus数据回调: 轴承ID=%d", data.BearingID)
+	modbusReceiver.SetDataCallback(func(data *models.SensorData) {
+		log.Printf("Modbus数据回调: 轴承ID=%d, 温度=%.2f°C", data.BearingID, data.Temperature)
 	})
 
-	if err := modbusServer.Start(ctx); err != nil {
-		log.Printf("Modbus服务器启动失败（将继续运行）: %v", err)
+	go func() {
+		for msg := range channels.SensorDataChan {
+			if msg.Valid && msg.Data != nil {
+				log.Printf("[数据总线] 传感器数据: 轴承 %d, 温度 %.2f°C, 载荷 %.0fN",
+					msg.Data.BearingID, msg.Data.Temperature, msg.Data.RadialLoad)
+			} else if !msg.Valid {
+				log.Printf("[数据总线] 无效数据: %s", msg.Error)
+			}
+		}
+	}()
+
+	if err := modbusReceiver.Start(ctx); err != nil {
+		log.Printf("Modbus接收器启动失败（将继续运行）: %v", err)
+	} else {
+		log.Printf("Modbus接收器已启动在端口 %d", config.AppConfig.Server.ModbusPort)
 	}
-	defer modbusServer.Stop()
+	defer modbusReceiver.Stop()
 
 	r := gin.Default()
 	r.Use(api.CORSMiddleware(config.AppConfig.Server.CORSOrigins))

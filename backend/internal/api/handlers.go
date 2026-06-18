@@ -11,19 +11,16 @@ import (
 	"github.com/gin-gonic/gin"
 	"noria-bearing-system/internal/database"
 	"noria-bearing-system/internal/models"
-	"noria-bearing-system/internal/simulation"
+	"noria-bearing-system/internal/modules/life_predictor"
+	"noria-bearing-system/internal/modules/messages"
+	"noria-bearing-system/internal/modules/wear_simulator"
 )
 
 type Handler struct {
-	wearCalc *simulation.WearCalculator
-	lifePred *simulation.LifePredictor
 }
 
 func NewHandler() *Handler {
-	return &Handler{
-		wearCalc: simulation.NewWearCalculator(),
-		lifePred: simulation.NewLifePredictor(),
-	}
+	return &Handler{}
 }
 
 func CORSMiddleware(origins []string) gin.HandlerFunc {
@@ -290,7 +287,7 @@ func (h *Handler) GetOilFilmMap(c *gin.Context) {
 		avgFilm = sensorData.OilFilmThickness
 	}
 
-	grid := simulation.GenerateOilFilmMap(*bearing, avgLoad, avgSpeed, avgTemp, avgFilm)
+	grid := wear_simulator.GenerateOilFilmMap(*bearing, avgLoad, avgSpeed, avgTemp, avgFilm)
 
 	c.JSON(http.StatusOK, gin.H{
 		"bearing_id":  bearingID,
@@ -341,15 +338,18 @@ func (h *Handler) TriggerCalculation(c *gin.Context) {
 		previousTotal = lastWear.TotalWearMicrom
 	}
 
-	wearInput := &simulation.WearCalcInput{
+	wearReq := &messages.WearCalcRequest{
 		Bearing:       *targetBearing,
 		SensorData:    sensorData,
 		PreviousTotal: previousTotal,
 		PeriodStart:   periodStart,
 		PeriodEnd:     now,
+		RequestID:     "api-" + strconv.Itoa(body.BearingID),
 	}
 
-	wearResult := h.wearCalc.Calculate(wearInput)
+	tempWearChan := make(chan messages.WearCalcResult, 1)
+	syncWearCalc := wear_simulator.NewWearSimulator(make(chan messages.WearCalcRequest, 1), tempWearChan)
+	wearResult := syncWearCalc.Calculate(wearReq)
 
 	wearDB := &models.WearResult{
 		BearingID:             body.BearingID,
@@ -370,14 +370,17 @@ func (h *Handler) TriggerCalculation(c *gin.Context) {
 	wearHistory, _ := database.Instance.GetWearHistory(ctx, body.BearingID, 100)
 	runningHours := time.Since(targetBearing.InstalledAt).Hours()
 
-	lifeInput := &simulation.LifePredInput{
+	lifeReq := &messages.LifePredRequest{
 		Bearing:      *targetBearing,
 		WearHistory:  wearHistory,
 		CurrentWear:  wearResult.TotalWearMicrom,
 		RunningHours: runningHours,
+		RequestID:    "api-" + strconv.Itoa(body.BearingID),
 	}
 
-	lifeResult := h.lifePred.Predict(lifeInput)
+	tempLifeChan := make(chan messages.LifePredResult, 1)
+	syncLifePred := life_predictor.NewLifePredictor(make(chan messages.LifePredRequest, 1), tempLifeChan)
+	lifeResult := syncLifePred.Predict(lifeReq)
 
 	lifeDB := &models.LifePrediction{
 		BearingID:              body.BearingID,
@@ -429,18 +432,21 @@ func (h *Handler) DebugWeibull(c *gin.Context) {
 		bearing = bearings[0]
 	}
 
-	input := &simulation.LifePredInput{
+	lifeReq := &messages.LifePredRequest{
 		Bearing:      bearing,
 		CurrentWear:  50,
 		RunningHours: 1000,
+		RequestID:    "debug",
 	}
 
 	for _, v := range data {
 		wr := models.WearResult{}
 		wr.WearRateMicromPerHour = &v
-		input.WearHistory = append(input.WearHistory, wr)
+		lifeReq.WearHistory = append(lifeReq.WearHistory, wr)
 	}
 
-	result := h.lifePred.Predict(input)
+	tempLifeChan := make(chan messages.LifePredResult, 1)
+	syncLifePred := life_predictor.NewLifePredictor(make(chan messages.LifePredRequest, 1), tempLifeChan)
+	result := syncLifePred.Predict(lifeReq)
 	c.JSON(http.StatusOK, result)
 }

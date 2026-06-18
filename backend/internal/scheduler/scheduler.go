@@ -6,33 +6,32 @@ import (
 	"log"
 	"time"
 
+	"github.com/google/uuid"
 	"noria-bearing-system/internal/config"
 	"noria-bearing-system/internal/database"
 	"noria-bearing-system/internal/models"
-	"noria-bearing-system/internal/mqtt"
-	"noria-bearing-system/internal/simulation"
+	"noria-bearing-system/internal/modules/messages"
 )
 
 type Scheduler struct {
-	wearCalc     *simulation.WearCalculator
-	lifePred     *simulation.LifePredictor
-	alertMgr     *mqtt.AlertManager
-	wearTicker   *time.Ticker
-	predTicker   *time.Ticker
-	alertTicker  *time.Ticker
-	stopCh       chan struct{}
+	channels    *messages.ModuleChannels
+	wearTicker  *time.Ticker
+	predTicker  *time.Ticker
+	alertTicker *time.Ticker
+	stopCh      chan struct{}
+	running     bool
 }
 
-func NewScheduler(alertMgr *mqtt.AlertManager) *Scheduler {
+func NewScheduler(channels *messages.ModuleChannels) *Scheduler {
 	return &Scheduler{
-		wearCalc: simulation.NewWearCalculator(),
-		lifePred: simulation.NewLifePredictor(),
-		alertMgr: alertMgr,
+		channels: channels,
 		stopCh:   make(chan struct{}),
+		running:  false,
 	}
 }
 
 func (s *Scheduler) Start() {
+	s.running = true
 	s.wearTicker = time.NewTicker(time.Duration(config.AppConfig.WearCalc.IntervalMinutes) * time.Minute)
 	s.predTicker = time.NewTicker(time.Duration(config.AppConfig.LifePred.IntervalMinutes) * time.Minute)
 	s.alertTicker = time.NewTicker(5 * time.Minute)
@@ -42,17 +41,21 @@ func (s *Scheduler) Start() {
 	go s.wearLoop()
 	go s.predictionLoop()
 	go s.alertLoop()
+	go s.resultListenerLoop()
 
 	go func() {
 		time.Sleep(5 * time.Second)
 		s.runWearCalculation()
+		time.Sleep(2 * time.Second)
 		s.runLifePrediction()
+		time.Sleep(2 * time.Second)
 		s.runAlertCheck()
 	}()
 }
 
 func (s *Scheduler) Stop() {
 	close(s.stopCh)
+	s.running = false
 	if s.wearTicker != nil {
 		s.wearTicker.Stop()
 	}
@@ -98,6 +101,25 @@ func (s *Scheduler) alertLoop() {
 	}
 }
 
+func (s *Scheduler) resultListenerLoop() {
+	for {
+		select {
+		case result, ok := <-s.channels.WearResultChan:
+			if !ok {
+				return
+			}
+			s.handleWearResult(&result)
+		case result, ok := <-s.channels.LifeResultChan:
+			if !ok {
+				return
+			}
+			s.handleLifeResult(&result)
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
 func (s *Scheduler) runWearCalculation() {
 	ctx := context.Background()
 	bearings, err := database.Instance.GetAllBearings(ctx)
@@ -107,11 +129,11 @@ func (s *Scheduler) runWearCalculation() {
 	}
 
 	for _, bearing := range bearings {
-		s.calculateBearingWear(ctx, bearing)
+		s.sendWearRequest(ctx, bearing)
 	}
 }
 
-func (s *Scheduler) calculateBearingWear(ctx context.Context, bearing models.Bearing) {
+func (s *Scheduler) sendWearRequest(ctx context.Context, bearing models.Bearing) {
 	now := time.Now()
 	periodStart := now.Add(-time.Duration(config.AppConfig.WearCalc.IntervalMinutes) * time.Minute)
 
@@ -121,52 +143,38 @@ func (s *Scheduler) calculateBearingWear(ctx context.Context, bearing models.Bea
 		return
 	}
 
-	if len(sensorData) == 0 {
-		log.Printf("轴承 %d 无传感器数据，跳过磨损计算", bearing.ID)
-		return
-	}
-
 	previousTotal := bearing.InitialWearMicrom
 	lastWear, err := database.Instance.GetLatestWearResult(ctx, bearing.ID)
 	if err == nil && lastWear != nil {
 		previousTotal = lastWear.TotalWearMicrom
 	}
 
-	input := &simulation.WearCalcInput{
+	reqID := uuid.New().String()
+	request := messages.WearCalcRequest{
 		Bearing:       bearing,
 		SensorData:    sensorData,
 		PreviousTotal: previousTotal,
 		PeriodStart:   periodStart,
 		PeriodEnd:     now,
+		RequestID:     reqID,
 	}
 
-	result := s.wearCalc.Calculate(input)
-
-	note := "自动计算"
-	wearResult := &models.WearResult{
-		BearingID:             bearing.ID,
-		CalculatedAt:          now,
-		PeriodStart:           periodStart,
-		PeriodEnd:             now,
-		WearDepthMicrom:       result.WearDepthMicrom,
-		WearRateMicromPerHour: &result.WearRateMicromPerHour,
-		TotalWearMicrom:       result.TotalWearMicrom,
-		ArchardWearVolume:     &result.ArchardWearVolume,
-		EHLFilmParameter:      &result.EHLFilmParameter,
-		SlidingDistance:       &result.SlidingDistance,
-		WearCoefficient:       &result.WearCoefficient,
-		ContactPressure:       &result.ContactPressure,
-		CalculationNote:       &note,
+	select {
+	case s.channels.WearRequestChan <- request:
+		log.Printf("已发送磨损计算请求 (轴承 %s, 请求ID: %s)", bearing.BearingCode, reqID)
+	default:
+		log.Printf("磨损计算请求通道已满，丢弃请求 (轴承 %s)", bearing.BearingCode)
 	}
+}
 
-	if err := database.Instance.InsertWearResult(ctx, wearResult); err != nil {
-		log.Printf("保存磨损结果失败 (轴承 %d): %v", bearing.ID, err)
+func (s *Scheduler) handleWearResult(result *messages.WearCalcResult) {
+	if !result.Success {
+		log.Printf("磨损计算失败 (轴承 %d, 请求ID: %s): %s", result.BearingID, result.RequestID, result.Error)
 		return
 	}
 
-	log.Printf("轴承 %s 磨损计算完成: 阶段磨损=%.4fμm, 累计磨损=%.4fμm, 磨损率=%.6fμm/h, EHL参数=%.3f",
-		bearing.BearingCode, result.WearDepthMicrom, result.TotalWearMicrom,
-		result.WearRateMicromPerHour, result.EHLFilmParameter)
+	log.Printf("磨损计算完成 (轴承 %d, 请求ID: %s): 阶段磨损=%.4fμm, 累计磨损=%.4fμm, EHL=%.3f",
+		result.BearingID, result.RequestID, result.WearDepthMicrom, result.TotalWearMicrom, result.EHLFilmParameter)
 }
 
 func (s *Scheduler) runLifePrediction() {
@@ -178,11 +186,11 @@ func (s *Scheduler) runLifePrediction() {
 	}
 
 	for _, bearing := range bearings {
-		s.predictBearingLife(ctx, bearing)
+		s.sendLifeRequest(ctx, bearing)
 	}
 }
 
-func (s *Scheduler) predictBearingLife(ctx context.Context, bearing models.Bearing) {
+func (s *Scheduler) sendLifeRequest(ctx context.Context, bearing models.Bearing) {
 	wearHistory, err := database.Instance.GetWearHistory(ctx, bearing.ID, 100)
 	if err != nil {
 		log.Printf("获取轴承 %d 磨损历史失败: %v", bearing.ID, err)
@@ -196,39 +204,31 @@ func (s *Scheduler) predictBearingLife(ctx context.Context, bearing models.Beari
 
 	runningHours := time.Since(bearing.InstalledAt).Hours()
 
-	input := &simulation.LifePredInput{
+	reqID := uuid.New().String()
+	request := messages.LifePredRequest{
 		Bearing:      bearing,
 		WearHistory:  wearHistory,
 		CurrentWear:  currentWear,
 		RunningHours: runningHours,
+		RequestID:    reqID,
 	}
 
-	result := s.lifePred.Predict(input)
-
-	prediction := &models.LifePrediction{
-		BearingID:              bearing.ID,
-		PredictedAt:            time.Now(),
-		WeibullShape:           result.WeibullShape,
-		WeibullScale:           result.WeibullScale,
-		RunningHours:           runningHours,
-		PredictedRULHours:      result.PredictedRULHours,
-		Reliability:            &result.Reliability,
-		FailureProbability:     &result.FailureProbability,
-		ConfidenceIntervalLow:  &result.ConfidenceIntervalLow,
-		ConfidenceIntervalHigh: &result.ConfidenceIntervalHigh,
-		WearRateTrend:          &result.WearRateTrend,
-		FatigueDamage:          &result.FatigueDamage,
-		PredictionMethod:       "weibull_mixed",
+	select {
+	case s.channels.LifeRequestChan <- request:
+		log.Printf("已发送寿命预测请求 (轴承 %s, 请求ID: %s)", bearing.BearingCode, reqID)
+	default:
+		log.Printf("寿命预测请求通道已满，丢弃请求 (轴承 %s)", bearing.BearingCode)
 	}
+}
 
-	if err := database.Instance.InsertLifePrediction(ctx, prediction); err != nil {
-		log.Printf("保存寿命预测失败 (轴承 %d): %v", bearing.ID, err)
+func (s *Scheduler) handleLifeResult(result *messages.LifePredResult) {
+	if !result.Success {
+		log.Printf("寿命预测失败 (轴承 %d, 请求ID: %s): %s", result.BearingID, result.RequestID, result.Error)
 		return
 	}
 
-	log.Printf("轴承 %s 寿命预测完成: 预测RUL=%.2f小时, 可靠度=%.4f, Weibull形状=%.3f, 疲劳损伤=%.4f",
-		bearing.BearingCode, result.PredictedRULHours, result.Reliability,
-		result.WeibullShape, result.FatigueDamage)
+	log.Printf("寿命预测完成 (轴承 %d, 请求ID: %s): RUL=%.2f小时, 可靠度=%.4f, β=%.3f",
+		result.BearingID, result.RequestID, result.PredictedRULHours, result.Reliability, result.WeibullShape)
 }
 
 func (s *Scheduler) runAlertCheck() {
@@ -256,12 +256,12 @@ func (s *Scheduler) runAlertCheck() {
 			continue
 		}
 
-		s.checkWearAlert(ctx, bearing, status)
-		s.checkOilFilmAlert(ctx, bearing, status)
+		s.checkWearAlert(bearing, status)
+		s.checkOilFilmAlert(bearing, status)
 	}
 }
 
-func (s *Scheduler) checkWearAlert(ctx context.Context, bearing models.Bearing, status models.BearingLatestStatus) {
+func (s *Scheduler) checkWearAlert(bearing models.Bearing, status models.BearingLatestStatus) {
 	if status.TotalWearMicrom == nil {
 		return
 	}
@@ -289,10 +289,10 @@ func (s *Scheduler) checkWearAlert(ctx context.Context, bearing models.Bearing, 
 		return
 	}
 
-	s.sendAlert(ctx, bearing, alertType, alertLevel, message, &threshold, &totalWear)
+	s.sendAlert(&bearing, alertType, alertLevel, message, &threshold, &totalWear)
 }
 
-func (s *Scheduler) checkOilFilmAlert(ctx context.Context, bearing models.Bearing, status models.BearingLatestStatus) {
+func (s *Scheduler) checkOilFilmAlert(bearing models.Bearing, status models.BearingLatestStatus) {
 	if status.OilFilmThickness == nil {
 		return
 	}
@@ -309,42 +309,28 @@ func (s *Scheduler) checkOilFilmAlert(ctx context.Context, bearing models.Bearin
 	message := fmt.Sprintf("轴承 %s 润滑油膜破裂！油膜厚度%.4fμm低于安全阈值%.4fμm，存在干摩擦风险",
 		bearing.BearingCode, filmThickness, minFilm)
 
-	s.sendAlert(ctx, bearing, alertType, alertLevel, message, &minFilm, &filmThickness)
+	s.sendAlert(&bearing, alertType, alertLevel, message, &minFilm, &filmThickness)
 }
 
 func (s *Scheduler) sendAlert(
-	ctx context.Context,
-	bearing models.Bearing,
+	bearing *models.Bearing,
 	alertType, alertLevel, message string,
 	threshold, actualValue *float64,
 ) {
-	if !s.alertMgr.ShouldAlert(bearing.ID, alertType) {
-		return
+	alert := messages.AlertMessage{
+		Bearing:      bearing,
+		AlertType:    alertType,
+		AlertLevel:   alertLevel,
+		AlertMessage: message,
+		Threshold:    threshold,
+		ActualValue:  actualValue,
+		Timestamp:    time.Now(),
 	}
 
-	alert := &models.AlertEvent{
-		BearingID:      bearing.ID,
-		AlertTime:      time.Now(),
-		AlertType:      alertType,
-		AlertLevel:     alertLevel,
-		AlertMessage:   message,
-		ThresholdValue: threshold,
-		ActualValue:    actualValue,
+	select {
+	case s.channels.AlertChan <- alert:
+		log.Printf("告警已发送到通道: [%s] %s - %s", alertLevel, bearing.BearingCode, message)
+	default:
+		log.Printf("告警通道已满，丢弃告警 (轴承 %d)", bearing.ID)
 	}
-
-	topic, err := s.alertMgr.PublishAlert(&bearing, alert)
-	if err != nil {
-		log.Printf("MQTT告警推送失败: %v", err)
-	}
-	if topic != "" {
-		alert.MQTTTopic = &topic
-	}
-
-	if err := database.Instance.InsertAlertEvent(ctx, alert); err != nil {
-		log.Printf("保存告警事件失败: %v", err)
-		return
-	}
-
-	s.alertMgr.MarkAlerted(bearing.ID, alertType)
-	log.Printf("告警已触发: [%s] %s - %s", alertLevel, bearing.BearingCode, message)
 }

@@ -10,7 +10,7 @@ const App = {
     init() {
         this._setupNavigation();
         this._initCharts();
-        this._initBearingView();
+        this._initBearingPanel();
         this._initOilFilmView();
         this._init3DView();
         this._setupEventListeners();
@@ -39,9 +39,9 @@ const App = {
 
         if (viewName === "3d") {
             setTimeout(() => {
-                if (Noria3D.camera && Noria3D.renderer) {
+                if (Waterwheel3D.camera && Waterwheel3D.renderer) {
                     const container = document.getElementById("three-scene");
-                    Noria3D._onResize(container);
+                    Waterwheel3D._onResize(container);
                 }
             }, 100);
         }
@@ -67,8 +67,8 @@ const App = {
         Charts.initWearTrend("weartrend-chart");
     },
 
-    _initBearingView() {
-        BearingView.init("bearing-canvas");
+    _initBearingPanel() {
+        BearingPanel.init("bearing-canvas");
     },
 
     _initOilFilmView() {
@@ -77,7 +77,7 @@ const App = {
 
     _init3DView() {
         setTimeout(() => {
-            Noria3D.init("three-scene", {
+            Waterwheel3D.init("three-scene", {
                 diameter: 8.5,
                 onBearingClick: (bearing) => {
                     this._selectBearing(bearing);
@@ -130,11 +130,11 @@ const App = {
         });
 
         document.getElementById("show-wear").addEventListener("change", (e) => {
-            BearingView.setOption("showWear", e.target.checked);
+            BearingPanel.setOption("showWear", e.target.checked);
         });
 
         document.getElementById("show-load").addEventListener("change", (e) => {
-            BearingView.setOption("showLoad", e.target.checked);
+            BearingPanel.setOption("showLoad", e.target.checked);
         });
 
         document.getElementById("calc-now").addEventListener("click", async () => {
@@ -149,17 +149,17 @@ const App = {
         });
 
         document.getElementById("auto-rotate").addEventListener("change", (e) => {
-            Noria3D.setAutoRotate(e.target.checked);
+            Waterwheel3D.setAutoRotate(e.target.checked);
         });
 
         document.getElementById("speed-factor").addEventListener("input", (e) => {
             const val = parseFloat(e.target.value);
-            Noria3D.setRotationSpeed(val);
+            Waterwheel3D.setRotationSpeed(val);
             document.getElementById("speed-value").textContent = `${val.toFixed(1)}x`;
         });
 
         document.getElementById("reset-view").addEventListener("click", () => {
-            Noria3D.resetView();
+            Waterwheel3D.resetView();
         });
 
         document.getElementById("film-view-type").addEventListener("change", (e) => {
@@ -217,7 +217,7 @@ const App = {
                 this._selectBearing(bearings[0]);
             }
 
-            Noria3D.setBearings(bearings);
+            Waterwheel3D.setBearings(bearings);
         } catch (err) {
             console.error("加载轴承列表失败:", err);
         }
@@ -316,7 +316,7 @@ const App = {
     },
 
     async _loadBearingDetail(bearing) {
-        BearingView.setBearing(bearing);
+        BearingPanel.setBearing(bearing);
 
         const infoRows = document.getElementById("bearing-info-rows");
         infoRows.innerHTML = `
@@ -339,8 +339,8 @@ const App = {
                 API.getWearHistory(bearing.id).catch(() => []),
             ]);
 
-            BearingView.setWearResult(wear);
-            BearingView.setSensorData(sensor);
+            BearingPanel.setWearResult(wear);
+            BearingPanel.setSensorData(sensor);
 
             if (wear) {
                 const ratio = Math.min(100, (wear.total_wear_microm / bearing.wear_limit_microm) * 100);
@@ -445,8 +445,8 @@ const App = {
             Charts.updateRealtime(sensor);
         }
 
-        if (Noria3D && bearing) {
-            Noria3D.setWheelRPM(sensor?.rotational_speed || 15);
+        if (Waterwheel3D && bearing) {
+            Waterwheel3D.setWheelRPM(sensor?.rotational_speed || 15);
         }
     },
 
@@ -467,7 +467,7 @@ const App = {
             this._renderRecentAlerts(alerts);
 
             statuses.forEach((s) => {
-                Noria3D.updateBearingHealth(s.bearing_id, s.health_status);
+                Waterwheel3D.updateBearingHealth(s.bearing_id, s.health_status);
             });
 
             if (this.state.selectedBearing) {

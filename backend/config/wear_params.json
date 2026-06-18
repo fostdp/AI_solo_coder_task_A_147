@@ -1,0 +1,22 @@
+{
+  "archard_k_base": 1.0e-8,
+  "ehl_reference_temp_celsius": 40.0,
+  "pressure_viscosity_coefficient": 2.2e-8,
+  "reduced_elastic_modulus_pa": 2.0e11,
+  "surface_roughness_rms_meters": 0.4e-6,
+  "temp_correction_factor_per_degree": 0.02,
+  "full_film_lambda_threshold": 3.0,
+  "mixed_lubrication_lambda_threshold": 1.0,
+  "wear_coefficient_factors": {
+    "full_film": 0.1,
+    "mixed_min": 0.1,
+    "mixed_max": 2.0,
+    "boundary_min": 2.0,
+    "boundary_max": 5.0
+  },
+  "hardness_conversion_factor": 9.80665e6,
+  "oil_film_grid": {
+    "size_x": 64,
+    "size_y": 32
+  }
+}
